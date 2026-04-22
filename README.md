@@ -9,6 +9,7 @@ A beginner-friendly Streamlit platform for RNA/DNA aptamer QSAR modeling.
 - Lets users enter aptamer-target interaction descriptors for every aptamer, including hydrogen bonds, hydrophobic contacts, pi-stacking, electrostatic contacts, salt bridges, metal coordination, van der Waals contacts, water bridges, base-pairing contacts, base-stacking contacts, and target-contact counts.
 - Trains regression or classification QSAR models with scikit-learn.
 - Predicts and ranks new aptamers.
+- Generates new model-guided aptamer candidates by mutating a selected seed aptamer, scoring candidates with the trained model, and ranking predicted improvements.
 - Exports descriptor tables, model leaderboards, predictions, and reports.
 
 ## Run locally on Windows

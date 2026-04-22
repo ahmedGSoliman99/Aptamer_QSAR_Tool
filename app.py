@@ -77,7 +77,7 @@ class ModelBundle:
     created_at: str
 
 def init_state() -> None:
-    defaults = {"raw_df": None, "validated_df": None, "interaction_df": None, "descriptor_df": None, "descriptor_options": DescriptorOptions(), "training_result": None, "active_bundle": None, "prediction_df": None, "prediction_descriptor_df": None}
+    defaults = {"raw_df": None, "validated_df": None, "interaction_df": None, "descriptor_df": None, "descriptor_options": DescriptorOptions(), "training_result": None, "active_bundle": None, "prediction_df": None, "prediction_descriptor_df": None, "design_df": None, "design_descriptor_df": None}
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -372,6 +372,67 @@ def plot_pca(desc_df: pd.DataFrame, color: str | None = None) -> go.Figure:
     plot_df = desc_df[["Name", "MoleculeType"]].copy() if "MoleculeType" in desc_df.columns else desc_df[["Name"]].copy(); plot_df["PC1"] = pcs[:,0]; plot_df["PC2"] = pcs[:,1]
     return px.scatter(plot_df, x="PC1", y="PC2", hover_name="Name", color=color if color in plot_df.columns else None, template=PLOT_TEMPLATE, title="PCA Aptamer Descriptor Space")
 
+def edit_distance(a: str, b: str) -> int:
+    if a == b: return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1): cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+def mutate_aptamer_sequence(seq: str, mol_type: str, rng: np.random.Generator, max_edits: int, allow_indels: bool, min_len: int, max_len: int) -> str:
+    alphabet = list(BASES_RNA if mol_type == "RNA" else BASES_DNA); chars = list(seq); edits = int(rng.integers(1, max(2, max_edits + 1)))
+    for _ in range(edits):
+        ops = ["substitute"]
+        if allow_indels and len(chars) < max_len: ops.append("insert")
+        if allow_indels and len(chars) > min_len: ops.append("delete")
+        op = str(rng.choice(ops))
+        if op == "substitute" and chars:
+            idx = int(rng.integers(0, len(chars))); choices = [b for b in alphabet if b != chars[idx]]; chars[idx] = str(rng.choice(choices))
+        elif op == "insert":
+            idx = int(rng.integers(0, len(chars) + 1)); chars.insert(idx, str(rng.choice(alphabet)))
+        elif op == "delete" and chars:
+            idx = int(rng.integers(0, len(chars))); chars.pop(idx)
+    return "".join(chars)
+
+def generate_aptamer_candidates(seed_seq: str, mol_type: str, n_candidates: int, max_edits: int, allow_indels: bool, min_len: int, max_len: int, protected_motif: str, random_seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(int(random_seed)); seen = {seed_seq}; rows = [{"Name": "Seed_reference", "Sequence": seed_seq, "DesignStatus": "Seed"}]
+    attempts = 0; motif = normalize_sequence(protected_motif, mol_type) if protected_motif else ""
+    while len(rows) <= n_candidates and attempts < n_candidates * 80:
+        attempts += 1; seq = mutate_aptamer_sequence(seed_seq, mol_type, rng, max_edits, allow_indels, min_len, max_len)
+        if seq in seen or len(seq) < min_len or len(seq) > max_len: continue
+        if motif and motif not in seq: continue
+        ok, _ = sequence_validity(seq, mol_type)
+        if not ok: continue
+        seen.add(seq); rows.append({"Name": f"Designed_Aptamer_{len(rows):03d}", "Sequence": seq, "DesignStatus": "Candidate"})
+    return pd.DataFrame(rows)
+
+def seed_interaction_profile(seed_name: str, seed_seq: str, interaction_df: pd.DataFrame | None) -> pd.Series:
+    if not isinstance(interaction_df, pd.DataFrame) or interaction_df.empty: return pd.Series(dtype=float)
+    name_match = interaction_df.get("Name", pd.Series(index=interaction_df.index, dtype=object)).astype(str) == str(seed_name)
+    seq_match = interaction_df.get("Sequence", pd.Series(index=interaction_df.index, dtype=object)).astype(str) == str(seed_seq)
+    match = interaction_df[name_match | seq_match]
+    return match.iloc[0] if not match.empty else pd.Series(dtype=float)
+
+def build_design_interactions(candidate_df: pd.DataFrame, mode: str, seed_profile: pd.Series) -> pd.DataFrame:
+    out = candidate_df[["Name", "Sequence"]].copy()
+    for col in INTERACTION_COLUMNS:
+        out[col] = safe_float(seed_profile.get(col, 0.0)) if mode.startswith("Copy") else 0.0
+    out["InteractionAssumption"] = "copied_from_seed" if mode.startswith("Copy") else "unknown_set_to_zero"
+    return out
+
+def annotate_design_results(pred_df: pd.DataFrame, desc_df: pd.DataFrame, seed_seq: str) -> pd.DataFrame:
+    cols = [c for c in ["Name", "Sequence", "Length", "GC_Fraction", "SelfComplementarity", "LongestHomopolymer", "GQuadruplexProxy_GGG_Count"] if c in desc_df.columns]
+    out = pred_df.merge(desc_df[cols], on=["Name", "Sequence"], how="left") if cols else pred_df.copy()
+    seed_score = pd.to_numeric(out.loc[out["DesignStatus"].eq("Seed"), "RankingScore"], errors="coerce") if "DesignStatus" in out.columns else pd.Series(dtype=float)
+    baseline = float(seed_score.iloc[0]) if not seed_score.empty and pd.notna(seed_score.iloc[0]) else float(pd.to_numeric(out["RankingScore"], errors="coerce").min())
+    out["PredictedImprovement_vs_Seed"] = pd.to_numeric(out["RankingScore"], errors="coerce") - baseline
+    out["EditDistanceToSeed"] = out["Sequence"].astype(str).map(lambda s: edit_distance(seed_seq, s))
+    if {"GC_Fraction", "LongestHomopolymer", "SelfComplementarity"}.issubset(out.columns):
+        out["PassDesignHeuristics"] = (out["GC_Fraction"].between(0.25, 0.80) & (out["LongestHomopolymer"] <= 5) & (out["SelfComplementarity"] <= 0.85))
+    return out.sort_values(["PredictedImprovement_vs_Seed", "RankingScore"], ascending=False).reset_index(drop=True)
+
 def render_home() -> None:
     st.markdown("""<div class="apt-hero"><h1>Aptamer QSAR Tool</h1><p>RNA/DNA aptamer descriptor engineering, interaction-aware QSAR modeling, prediction, visualization, and report export.</p><p><b>Developed by Ahmed G. Soliman.</b></p></div>""", unsafe_allow_html=True)
     c1,c2,c3 = st.columns(3); c1.metric("Sequence descriptors", "DNA/RNA"); c2.metric("Interaction descriptors", len(INTERACTION_COLUMNS)); c3.metric("ML models", "Regression/Class")
@@ -469,6 +530,57 @@ def render_predict() -> None:
                 st.dataframe(pred[[c for c in ["Rank","Name","Sequence","RawModelPrediction","Prediction","RankingScore"] if c in pred.columns]], use_container_width=True)
         st.download_button("Download Predictions CSV", data=dataframe_csv(shown), file_name="aptamer_predictions.csv", mime="text/csv")
 
+def render_design() -> None:
+    st.subheader("7) Design New Aptamers")
+    bundle = st.session_state.active_bundle; desc = st.session_state.descriptor_df
+    if not isinstance(bundle, ModelBundle) or not isinstance(desc, pd.DataFrame) or desc.empty:
+        st.info("Train a model first, then this tab can generate and rank new aptamer candidates.")
+        return
+    st.warning("These are model-guided virtual candidates, not experimentally validated aptamers. Synthesize/test or validate by docking/MD before biological conclusions.")
+    seed_table = desc[["Name", "Sequence", "MoleculeType"] + ([bundle.target] if bundle.target in desc.columns else [])].copy()
+    direction = infer_direction(bundle.target)
+    if bundle.target in seed_table.columns and bundle.task_type == "regression":
+        target_num = pd.to_numeric(seed_table[bundle.target], errors="coerce")
+        default_idx = int(target_num.idxmin() if direction == "minimize" else target_num.idxmax()) if target_num.notna().any() else int(seed_table.index[0])
+        default_pos = list(seed_table.index).index(default_idx) if default_idx in list(seed_table.index) else 0
+    else:
+        default_pos = 0
+    seed_choice = st.selectbox("Seed aptamer to improve", options=list(seed_table.index), index=default_pos, format_func=lambda i: f"{seed_table.loc[i, 'Name']} | {seed_table.loc[i, 'Sequence']}")
+    seed_row = seed_table.loc[seed_choice]; seed_seq = str(seed_row["Sequence"]); mol_type = str(seed_row.get("MoleculeType", infer_molecule_type(seed_seq, "Auto")))
+    c1, c2, c3, c4 = st.columns(4)
+    n_candidates = c1.slider("Candidates to generate", 50, 1000, 250, 50)
+    max_edits = c2.slider("Max edits per candidate", 1, 8, 3, 1)
+    allow_indels = c3.checkbox("Allow insertions/deletions", value=False)
+    random_seed = c4.number_input("Random seed", min_value=1, max_value=999999, value=42, step=1)
+    c5, c6, c7 = st.columns(3)
+    min_len = c5.number_input("Minimum length", min_value=5, max_value=300, value=max(5, len(seed_seq) - 3), step=1)
+    max_len = c6.number_input("Maximum length", min_value=5, max_value=500, value=min(500, len(seed_seq) + 3), step=1)
+    protected_motif = c7.text_input("Protected motif to keep (optional)", value="")
+    interaction_mode = st.radio("Interaction descriptor assumption for designed candidates", ["Copy selected seed interactions", "Unknown interactions = zero"], horizontal=True)
+    if st.button("Generate Better Aptamer Candidates", type="primary", use_container_width=True):
+        candidates = generate_aptamer_candidates(seed_seq, mol_type, int(n_candidates), int(max_edits), bool(allow_indels), int(min_len), int(max_len), protected_motif, int(random_seed))
+        if candidates.empty or len(candidates) <= 1:
+            st.error("No valid candidates were generated. Relax motif/length/edit constraints and try again.")
+            return
+        validated = validate_dataframe(candidates, "Sequence", mol_type)
+        seed_profile = seed_interaction_profile(str(seed_row["Name"]), seed_seq, st.session_state.interaction_df)
+        interactions = build_design_interactions(validated[validated["Valid"] == True], interaction_mode, seed_profile)
+        design_desc = calculate_descriptors(validated, interactions, bundle.descriptor_options)
+        design_pred = predict_with_bundle(bundle, design_desc).merge(candidates[["Name", "DesignStatus"]], on="Name", how="left")
+        design_result = annotate_design_results(design_pred, design_desc, seed_seq)
+        st.session_state.design_df = design_result; st.session_state.design_descriptor_df = design_desc
+        better = int((design_result["DesignStatus"].eq("Candidate") & (design_result["PredictedImprovement_vs_Seed"] > 0)).sum())
+        st.success(f"Generated {len(candidates)-1} candidates. {better} candidates are predicted better than the seed by the current model.")
+    design_df = st.session_state.design_df
+    if isinstance(design_df, pd.DataFrame) and not design_df.empty:
+        only_better = st.checkbox("Show only candidates predicted better than seed", value=True)
+        shown = design_df[design_df["DesignStatus"].eq("Candidate")].copy()
+        if only_better and "PredictedImprovement_vs_Seed" in shown.columns: shown = shown[shown["PredictedImprovement_vs_Seed"] > 0]
+        display_cols = [c for c in ["Rank", "Name", "Sequence", "Prediction", "RankingScore", "PredictedImprovement_vs_Seed", "EditDistanceToSeed", "Length", "GC_Fraction", "SelfComplementarity", "LongestHomopolymer", "PassDesignHeuristics", "PredictionMeaning"] if c in shown.columns]
+        st.dataframe(shown[display_cols].head(100), use_container_width=True, height=360)
+        st.plotly_chart(px.bar(shown.head(30), x="Name", y="PredictedImprovement_vs_Seed", color="PassDesignHeuristics" if "PassDesignHeuristics" in shown.columns else None, template=PLOT_TEMPLATE, title="Top designed aptamer improvements"), use_container_width=True)
+        st.download_button("Download Designed Aptamers CSV", data=dataframe_csv(shown), file_name="designed_aptamer_candidates.csv", mime="text/csv", use_container_width=True)
+
 def render_visuals() -> None:
     st.subheader("7) Visualizations"); desc = st.session_state.descriptor_df
     if not isinstance(desc, pd.DataFrame) or desc.empty: st.info("Calculate descriptors first."); return
@@ -485,6 +597,8 @@ def render_export() -> None:
     for name,key in [("Validated","validated_df"),("Interactions","interaction_df"),("Descriptors","descriptor_df"),("Predictions","prediction_df")]:
         df = st.session_state.get(key)
         if isinstance(df, pd.DataFrame) and not df.empty: tables[name] = prediction_display(df) if name == "Predictions" else df
+    design_df = st.session_state.get("design_df")
+    if isinstance(design_df, pd.DataFrame) and not design_df.empty: tables["DesignedAptamers"] = prediction_display(design_df)
     result = st.session_state.training_result
     if isinstance(result, dict): tables["ModelLeaderboard"] = result["leaderboard"]
     if not tables: st.info("Nothing to export yet."); return
@@ -504,11 +618,14 @@ This tool is designed for RNA and DNA aptamers. It calculates sequence-derived n
 The tool also supports user-entered aptamer-target interaction descriptors. These can come from experiments, docking, molecular dynamics, structural annotation, or manual curation. Interaction features include hydrogen bonds, hydrophobic contacts, pi-stacking, electrostatic contacts, salt bridges, metal coordination, van der Waals contacts, water bridges, base-pairing contacts, base-stacking contacts, and total target-contact counts.
 
 Machine-learning models use scikit-learn pipelines with imputation, variance filtering, feature selection, scaling, repeated cross-validation, and regression/classification evaluation.
+
+### Aptamer design mode
+The design tab performs model-guided virtual evolution. It mutates a selected seed aptamer, calculates descriptors for the generated candidates, predicts their expected activity/affinity using the trained model, and ranks candidates predicted to improve over the seed. These candidates are hypotheses for experimental or structural validation, not guaranteed binders.
 """)
 
 def main() -> None:
     init_state(); st.sidebar.title(APP_NAME); st.sidebar.caption(f"Developed by {DEVELOPER_NAME}")
-    tabs = st.tabs(["Home", "Input", "Interactions", "Descriptors", "Train", "Evaluate", "Predict", "Visualizations", "Export", "About"])
+    tabs = st.tabs(["Home", "Input", "Interactions", "Descriptors", "Train", "Evaluate", "Predict", "Design", "Visualizations", "Export", "About"])
     with tabs[0]: render_home()
     with tabs[1]: render_input()
     with tabs[2]: render_interactions()
@@ -516,8 +633,9 @@ def main() -> None:
     with tabs[4]: render_train()
     with tabs[5]: render_evaluate()
     with tabs[6]: render_predict()
-    with tabs[7]: render_visuals()
-    with tabs[8]: render_export()
-    with tabs[9]: render_about()
+    with tabs[7]: render_design()
+    with tabs[8]: render_visuals()
+    with tabs[9]: render_export()
+    with tabs[10]: render_about()
 
 if __name__ == "__main__": main()
